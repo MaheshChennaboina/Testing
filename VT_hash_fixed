@@ -1,0 +1,285 @@
+# VT_hash_only_fixed.py
+# Works with Python 3.11+ (tested up to 3.13)
+# Encoding format: ISO-8859-1
+
+print("[*] Importing Python Modules ... ", end="")
+import os, time, json, sys
+from datetime import datetime
+import requests, json5
+from colorama import init, Fore, Style
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+import concurrent.futures
+
+init()
+print("done!")
+
+store_hashes = list()
+Store_hashes_Notfound = list()
+
+class VirusTotalScanner:
+    def __init__(self, debug_mode, timeout, api_keys_list, Master_CSV_filename, Sorted_Master_CSV_filename,
+                 After_Comparison_With_Archive_New_Filename, Threat_Intel_Report_filename, hashAndCount):
+        try:
+            os.remove('logs.txt')
+        except:
+            pass
+        self.logs = open("logs.txt", "a+")
+        self.timeout = timeout
+        self.api_keys_list = api_keys_list
+        self.debug_mode = debug_mode
+        self.Master_CSV_filename = Master_CSV_filename.replace(" ", "_") + ".csv"
+        self.Sorted_Master_CSV_filename = Sorted_Master_CSV_filename.replace(" ", "_") + ".csv"
+        self.After_Comparison_With_Archive_New_Filename = After_Comparison_With_Archive_New_Filename.replace(" ", "_")
+        self.Threat_Intel_Report_filename = Threat_Intel_Report_filename.replace(" ", "_")
+
+    def printer(self, log_text, log_type):
+        datetime_text = datetime.now().strftime(f"{Fore.WHITE}[Date: %d-%m-%Y] [Time: %H:%M:%S]{Style.RESET_ALL} ")
+        if log_type == "INFO":
+            datetime_text += f'[{Fore.GREEN}{log_type}{Style.RESET_ALL}] '
+            print(f'{datetime_text}{log_text}')
+        elif log_type == 'ERROR':
+            datetime_text += f'[{Fore.YELLOW}{log_type}{Style.RESET_ALL}] '
+            print(f'{datetime_text}{log_text}')
+
+        clean_datetime_text = datetime_text.replace(Fore.WHITE, '').replace(Fore.YELLOW, '').replace(
+            Fore.GREEN, '').replace(Fore.RED, '').replace(Style.RESET_ALL, '')
+        clean_logs = log_text.replace(Fore.WHITE, '').replace(Fore.YELLOW, '').replace(
+            Fore.GREEN, '').replace(Fore.RED, '').replace(Style.RESET_ALL, '')
+        self.logs.write(clean_datetime_text + clean_logs + "\n")
+
+    def start(self):
+        if not os.path.exists('Report'):
+            os.mkdir('Report')
+        if not os.path.exists('IOC-Archive-Database'):
+            os.mkdir('IOC-Archive-Database')
+
+        self.printer(f"{Fore.YELLOW}Hit Enter, For selecting {Fore.GREEN}Default Value!{Style.RESET_ALL}", "INFO")
+        input_excel_file = input(f"\n[?] Enter Excel file path Containing IOC [Default: Input.xlsx]: ")
+        if input_excel_file == "":
+            input_excel_file = "Input.xlsx"
+
+        self.archive_excel_file = input(
+            f"[?] Enter Archive Excel file path Containing Old IOC [Default: IOC-Archive-Database/ArchiveIOC.xlsx]: ")
+        if self.archive_excel_file == "":
+            self.archive_excel_file = "IOC-Archive-Database/ArchiveIOC.xlsx"
+
+        df = pd.read_excel(input_excel_file)
+        IOC_df = df[['Threat Actor Name', 'IOC Value', 'IOC Type']]
+        Rescan_IOCs = df["IOC Value"].to_list()
+
+        self.ThreadNumber = len(self.api_keys_list)
+        new_api_key_list = []
+        for i in range(round(len(IOC_df) / self.ThreadNumber)):
+            new_api_key_list.extend(self.api_keys_list)
+        new_api_key_list = new_api_key_list[:len(IOC_df)]
+        IOC_df.insert(3, "API", pd.Series(new_api_key_list), True)
+        IOC_df['API'] = IOC_df['API'].replace(np.nan, self.api_keys_list[0])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.ThreadNumber) as executor:
+            futures_rescan = [executor.submit(self.request_file_rescan, row, Rescan_IOCs) for _, row in IOC_df.iterrows()]
+            concurrent.futures.wait(futures_rescan)
+
+            self.printer(f"{Fore.YELLOW}Waiting before fetching updated results...{Style.RESET_ALL}", "INFO")
+            total_time = 180
+            steps = 100
+            for _ in tqdm(range(steps), desc="Loading...", ncols=80):
+                time.sleep(total_time / steps)
+
+            futures_scan = [executor.submit(self.scan_IOC, row) for _, row in IOC_df.iterrows()]
+            concurrent.futures.wait(futures_scan)
+
+        self.printer(f"{Fore.YELLOW}Sorting Master CSV based on {Fore.GREEN}Pyramid of Pain {Style.RESET_ALL}", "INFO")
+        self.sort_csv_based_on_IOC_type()
+        self.compare_final_data_with_archive()
+
+        os.remove(self.Master_CSV_filename)
+        os.remove(self.Sorted_Master_CSV_filename)
+
+    def scan_IOC(self, row):
+        ThreatActorName = row['Threat Actor Name']
+        IndicatorOfCompromise = row['IOC Value'].strip()
+        IOC_type = row['IOC Type']
+        api_key = row['API']
+        md5_hash, sha1_hash, sha256_hash = "", "", ""
+
+        if IOC_type in ['MD5', 'SHA1', 'SHA256']:
+            status, md5_hash, sha1_hash, sha256_hash, hashAndCount = self.check_IOC_hash(IndicatorOfCompromise, api_key)
+        else:
+            self.printer(f'{Fore.YELLOW}Unknown IOC Type: {Fore.RED}{IOC_type}{Style.RESET_ALL}', 'ERROR')
+            return
+
+        datetime_text = datetime.now().strftime(f"%d-%m-%Y")
+        data_list = [{
+            "Date": datetime_text,
+            "Threat Actor Name": ThreatActorName,
+            "Parent IOC Value": "",
+            "Referral IOC Type": "",
+            "Referral IOC Value": "",
+            "IOC Value": md5_hash if md5_hash else IndicatorOfCompromise,
+            "IOC Type": "MD5" if md5_hash else IOC_type,
+            "Status": status,
+        }]
+        df = pd.DataFrame(data_list)
+        self.write_data_to_csv(self.Master_CSV_filename, df)
+        time.sleep(15)
+
+    def write_data_to_csv(self, filename, df):
+        with open(filename, 'a', encoding='ISO-8859-1') as f:
+            df.to_csv(f, header=f.tell() == 0, index=False, lineterminator='\n')
+
+    def sort_csv_based_on_IOC_type(self):
+        # FIXED: tolerate malformed or extra-comma lines
+        df = pd.read_csv(self.Master_CSV_filename, encoding='ISO-8859-1', on_bad_lines='skip', engine='python')
+        df_Hash = df[df['IOC Type'].isin(['MD5', 'SHA1', 'SHA256'])]
+        df_Hash.to_csv(self.Sorted_Master_CSV_filename, index=False)
+
+    def compare_final_data_with_archive(self):
+        self.printer(f"{Fore.YELLOW}Comparing {Fore.GREEN}Sorted Master Excel{Fore.YELLOW} with {Fore.GREEN}Archive Excel{Style.RESET_ALL}", "INFO")
+        final_archive_ioc_list = []
+        df = pd.read_excel(self.archive_excel_file)
+        df = df['IOC Value']
+        for _, ioc in df.items():
+            final_archive_ioc_list.append(ioc.replace('[.]', '.'))
+
+        IOC_df = pd.read_csv(self.Sorted_Master_CSV_filename, encoding='ISO-8859-1', on_bad_lines='skip', engine='python')
+        for archive_ioc in final_archive_ioc_list:
+            index_names = IOC_df[IOC_df['IOC Value'] == archive_ioc].index
+            IOC_df.drop(index_names, inplace=True)
+
+        IOC_df = IOC_df.drop_duplicates(subset='IOC Value', keep='first')
+        IOC_df = IOC_df.drop(IOC_df[IOC_df['IOC Value'] == 'IOC Value'].index, errors='ignore')
+
+        writer = pd.ExcelWriter(
+            self.After_Comparison_With_Archive_New_Filename + datetime.now().strftime('_%d-%m-%Y_%H_%M_%S') + ".xlsx",
+            engine='xlsxwriter')
+
+        workbook = writer.book
+        header_format = workbook.add_format({'bold': True, 'font_size': 10, 'fg_color': '#7bb8ed', 'border': 1})
+
+        for sheet in ['Not Found', 'Clean', 'Malicious', 'FireEye Not Detected']:
+            temp_df = IOC_df.loc[IOC_df['Status'] == sheet]
+            if sheet == 'FireEye Not Detected':
+                sheet = 'Not Covered'
+            temp_df.to_excel(writer, sheet_name=sheet, index=False)
+            worksheet = writer.sheets[sheet]
+            for col_num, value in enumerate(temp_df.columns.values):
+                worksheet.write(0, col_num, value, header_format)
+                column_len = temp_df[value].astype(str).str.len().max()
+                worksheet.set_column(col_num, col_num, max(column_len, len(value)) + 3)
+
+        writer.close()
+        self.printer(f"{Fore.GREEN}Done :-){Style.RESET_ALL}", "INFO")
+
+    def request_file_rescan(self, row, ListOfIOCs):
+        api_key = row['API']
+        for ioc_hash in ListOfIOCs:
+            if ioc_hash not in store_hashes:
+                store_hashes.append(ioc_hash)
+                self.printer(f"{Fore.BLUE}Rescan request added: {Fore.MAGENTA}{ioc_hash}{Style.RESET_ALL}", "INFO")
+                url = f"https://www.virustotal.com/api/v3/files/{ioc_hash}/analyse"
+                headers = {"accept": "application/json", 'x-apikey': api_key}
+                response = requests.post(url, headers=headers, timeout=self.timeout)
+                if response.status_code == 200:
+                    self.printer(f"{Fore.YELLOW}Rescan request successful for {Fore.GREEN}{ioc_hash}{Style.RESET_ALL}", "INFO")
+                elif response.status_code == 404:
+                    Store_hashes_Notfound.append(ioc_hash)
+                    self.printer(f"{Fore.YELLOW}Rescan not found for {Fore.RED}{ioc_hash}{Style.RESET_ALL}", "INFO")
+                else:
+                    self.printer(f"{Fore.RED}Rescan failed for {Fore.GREEN}{ioc_hash}{Fore.RED}. Status: {response.status_code}{Style.RESET_ALL}", "ERROR")
+
+    def check_IOC_hash_notfound(self, ioc_hash, api_key):
+        if ioc_hash not in Store_hashes_Notfound:
+            url = 'https://www.virustotal.com/vtapi/v2/file/report'
+            params = {'apikey': api_key, 'resource': ioc_hash}
+            response = requests.get(url, params=params, timeout=self.timeout)
+            return response.json()
+        else:
+            return {"response_code": 0}
+
+    def check_IOC_hash(self, ioc_hash, api_key):
+        try:
+            md5_hash, sha1_hash, sha256_hash = "", "", ""
+            response = self.check_IOC_hash_notfound(ioc_hash, api_key)
+            if response['response_code'] != 0:
+                scan_result = response['scans']
+                final_scan_summary = response['positives']
+                malicous_vendors_count = sum(1 for vendor in scan_result.values() if vendor['detected'])
+                if final_scan_summary != 0:
+                    if (('McAfee' not in scan_result.keys()) and ('TrellixENS' not in scan_result.keys())):
+                        status = 'FireEye Not Detected'
+                    elif (('McAfee' in scan_result.keys()) and (scan_result['McAfee']['detected'] != True)):
+                        status = 'FireEye Not Detected'
+                    elif (('TrellixENS' in scan_result.keys()) and (scan_result['TrellixENS']['detected'] != True)):
+                        status = 'FireEye Not Detected'
+                    else:
+                        status = 'Malicious'
+                    md5_hash, sha1_hash, sha256_hash = response['md5'], response['sha1'], response['sha256']
+                else:
+                    status = 'Clean'
+                    md5_hash, sha1_hash, sha256_hash = response['md5'], response['sha1'], response['sha256']
+            else:
+                status = "Not Found"
+            return status, md5_hash, sha1_hash, sha256_hash, hashAndCount
+        except Exception as e:
+            self.printer(f"{Fore.YELLOW}Error in check_IOC_hash(): {Fore.RED}{e}{Style.RESET_ALL}", "ERROR")
+
+    @staticmethod
+    def find_latest_file(folder_path):
+        files = [f for f in os.listdir(folder_path) if f.endswith('.xlsx')]
+        if not files:
+            raise ValueError("No Excel files found in the folder.")
+        latest_file = max(files, key=lambda x: os.path.getctime(os.path.join(folder_path, x)))
+        return os.path.join(folder_path, latest_file)
+
+    @staticmethod
+    def process_not_covered_sheet(file1, file2):
+        df1 = pd.read_excel(file1, sheet_name='Not Covered')
+        df2 = pd.read_excel(file2)
+        file1_cleaned = df1[~df1['IOC Type'].isin(['MD5', 'SHA1'])]
+        df_merged = pd.merge(file1_cleaned, df2[["IOC Value", "Count"]], on="IOC Value", how='left')
+        with pd.ExcelWriter(file1, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+            df_merged.to_excel(writer, sheet_name='Not Covered', index=False)
+
+
+if __name__ == "__main__":
+    print(f"{Fore.YELLOW}[*] Reading Credentials from {Fore.GREEN}virustotal_conf.json{Fore.YELLOW} file ... {Style.RESET_ALL}", end="")
+    try:
+        f = open('virustotal_conf.json')
+        creds_json = json.load(f)
+
+        debug_mode = creds_json["debug_mode"]
+        timeout = creds_json["timeout"]
+        api_keys_list = creds_json["api_keys_list"]
+        Master_CSV_filename = creds_json["Master_CSV_filename"]
+        Sorted_Master_CSV_filename = creds_json["Sorted_Master_CSV_filename"]
+        After_Comparison_With_Archive_New_Filename = creds_json["After_Comparison_With_Archive_New_Filename"]
+        Threat_Intel_Report_filename = creds_json["Threat_Intel_Report_filename"]
+        hashAndCount = {}
+        print("done!")
+    except Exception as e:
+        print("failed!")
+        print("[!] ERROR: ", e)
+        sys.exit()
+
+    test = VirusTotalScanner(debug_mode, timeout, api_keys_list, Master_CSV_filename,
+                             Sorted_Master_CSV_filename, After_Comparison_With_Archive_New_Filename,
+                             Threat_Intel_Report_filename, hashAndCount)
+    test.start()
+
+    print(f"{Fore.YELLOW}Waiting for 10 seconds before processing the file...")
+    time.sleep(10)
+    df = pd.DataFrame(list(hashAndCount.items()), columns=['IOC Value', 'Count'])
+    df.to_excel('output.xlsx', index=False)
+
+    folder_path = "C:\\Users\\mchennaboina\\Videos\\VirusTotal_Scanner_3.11 2\\VirusTotal_Scanner_3.11\\SortedReport"
+    output_file = 'output.xlsx'
+    print(f"{Fore.YELLOW}Waiting for 5 seconds before processing the file...")
+    try:
+        latest_file = VirusTotalScanner.find_latest_file(folder_path)
+        time.sleep(10)
+        test.process_not_covered_sheet(latest_file, output_file)
+        print(f"The updates have been processed and saved back.")
+    except ValueError as e:
+        print(e)
